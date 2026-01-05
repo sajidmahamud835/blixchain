@@ -7,7 +7,7 @@
         "start:server": "node src/server/index.js",
         "start:client": "node src/client/index.js",
         "dev:server": "nodemon src/server/index.js",
-        "wallet:create": "node src/client/wallet.js create",
+        "wallet:create": "node src/shared/wallet.js create",
         "test": "jest"
     },
     "keywords": [

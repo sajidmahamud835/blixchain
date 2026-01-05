@@ -147,6 +147,30 @@ class BlixnodeServer {
                 data: this.pendingTransactions
             });
         });
+
+        // Get address balance
+        this.app.get('/address/:address/balance', (req, res) => {
+            const { address } = req.params;
+            let balance = 0;
+
+            // Scan chain (inefficient but works for prototype)
+            for (const block of this.chain) {
+                for (const tx of block.transactions) {
+                    if (tx.recipient === address) {
+                        balance += tx.amount;
+                    }
+                    if (tx.sender === address) {
+                        balance -= (tx.amount + tx.fee);
+                    }
+                }
+                // Check block reward
+                if (block.miner === address) {
+                    balance += block.reward;
+                }
+            }
+
+            res.json({ success: true, data: { address, balance } });
+        });
     }
 
     /**
