@@ -9,6 +9,7 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
+const rateLimit = require('express-rate-limit');
 
 const PROTOCOL = require('../shared/protocol');
 const {
@@ -18,7 +19,11 @@ const {
     calculateBlockHash,
     hashMeetsTarget
 } = require('../shared/crypto');
-const { isValidAddress } = require('../shared/wallet');
+const { isValidAddress, verify } = require('../shared/wallet');
+
+// Security Constants
+const MAX_WS_MESSAGE_SIZE = 100 * 1024; // 100KB max WebSocket message
+const MAX_PENDING_TRANSACTIONS = 10000; // Limit pending tx pool size
 
 class BlixnodeServer {
     constructor(port = 3030) {
@@ -30,6 +35,7 @@ class BlixnodeServer {
         // State
         this.connectedWallets = new Map();  // walletAddress -> { ws, joinedAt }
         this.pendingTransactions = [];
+        this.processedTxIds = new Set();    // Track processed txIds to prevent replay
         this.chain = [];
         this.currentChallenge = null;
         this.miningInProgress = false;
@@ -38,6 +44,13 @@ class BlixnodeServer {
         this.genesisTime = Date.now();
         this.totalSupply = 0;
         this.difficulty = 1;
+
+        // Rate limiting for API
+        this.blockSyncLimiter = rateLimit({
+            windowMs: 15 * 60 * 1000, // 15 minutes
+            max: 100, // limit each IP to 100 requests per windowMs
+            message: { success: false, message: 'Too many requests, please try again later' }
+        });
 
         // Initialize
         this.setupRoutes();
@@ -69,7 +82,12 @@ class BlixnodeServer {
      * Setup REST API routes
      */
     setupRoutes() {
-        this.app.use(express.json());
+        // Security: Limit JSON body size
+        this.app.use(express.json({ limit: '100kb' }));
+
+        // Apply rate limiting to block sync endpoints
+        this.app.use('/block', this.blockSyncLimiter);
+        this.app.use('/chain', this.blockSyncLimiter);
 
         // Pool status
         this.app.get('/pool/status', (req, res) => {
@@ -96,14 +114,20 @@ class BlixnodeServer {
             });
         });
 
-        // Get block by height
+        // Get block by height (with input validation)
         this.app.get('/block/:height', (req, res) => {
-            const height = parseInt(req.params.height);
-            if (height >= 0 && height < this.chain.length) {
-                res.json({ success: true, data: this.chain[height] });
-            } else {
-                res.status(404).json({ success: false, message: 'Block not found' });
+            const height = parseInt(req.params.height, 10);
+
+            // Input validation
+            if (isNaN(height) || height < 0 || !Number.isInteger(height)) {
+                return res.status(400).json({ success: false, message: 'Invalid block height: must be a non-negative integer' });
             }
+
+            if (height >= this.chain.length) {
+                return res.status(404).json({ success: false, message: 'Block not found' });
+            }
+
+            res.json({ success: true, data: this.chain[height] });
         });
 
         // Chain status
@@ -120,18 +144,50 @@ class BlixnodeServer {
             });
         });
 
-        // Submit transaction
+        // Submit transaction (with replay protection and signature verification)
         this.app.post('/transaction/submit', (req, res) => {
             const tx = req.body;
 
-            if (!this.validateTransaction(tx)) {
+            // Input type validation
+            if (!tx || typeof tx !== 'object') {
+                return res.status(400).json({ success: false, message: 'Invalid request body' });
+            }
+
+            // Validate transaction structure and signature
+            const validation = this.validateTransaction(tx);
+            if (!validation.valid) {
                 return res.status(400).json({
                     success: false,
-                    message: 'Invalid transaction'
+                    message: validation.reason || 'Invalid transaction'
                 });
             }
 
-            tx.id = sha256(JSON.stringify(tx) + Date.now());
+            // Generate unique transaction ID using nonce to prevent replay
+            tx.id = sha256(JSON.stringify({
+                sender: tx.sender,
+                recipient: tx.recipient,
+                amount: tx.amount,
+                fee: tx.fee,
+                nonce: tx.nonce,
+                timestamp: tx.timestamp
+            }));
+
+            // Check for replay attack
+            if (this.processedTxIds.has(tx.id)) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Transaction already processed (possible replay attack)'
+                });
+            }
+
+            // Check pending pool size limit
+            if (this.pendingTransactions.length >= MAX_PENDING_TRANSACTIONS) {
+                return res.status(503).json({
+                    success: false,
+                    message: 'Transaction pool is full, please try again later'
+                });
+            }
+
             this.pendingTransactions.push(tx);
 
             // Broadcast to miners
@@ -148,9 +204,18 @@ class BlixnodeServer {
             });
         });
 
-        // Get address balance
+        // Get address balance (with input validation)
         this.app.get('/address/:address/balance', (req, res) => {
             const { address } = req.params;
+
+            // Input validation
+            if (!isValidAddress(address)) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Invalid address format'
+                });
+            }
+
             let balance = 0;
 
             // Scan chain (inefficient but works for prototype)
@@ -181,8 +246,27 @@ class BlixnodeServer {
             let walletAddress = null;
 
             ws.on('message', (data) => {
+                // Security: Check message size limit
+                if (data.length > MAX_WS_MESSAGE_SIZE) {
+                    ws.send(JSON.stringify({
+                        type: 'error',
+                        message: `Message too large. Maximum size: ${MAX_WS_MESSAGE_SIZE} bytes`
+                    }));
+                    return;
+                }
+
                 try {
                     const message = JSON.parse(data);
+
+                    // Security: Basic type validation
+                    if (!message || typeof message !== 'object' || !message.type) {
+                        ws.send(JSON.stringify({
+                            type: 'error',
+                            message: 'Invalid message structure'
+                        }));
+                        return;
+                    }
+
                     this.handleMessage(ws, message, (addr) => {
                         walletAddress = addr;
                     });
@@ -429,23 +513,86 @@ class BlixnodeServer {
         this.chain.push(block);
         this.totalSupply += block.reward || 0;
 
-        // Clear mined transactions from pending
+        // Clear mined transactions from pending and mark as processed
         const minedTxIds = block.transactions.map(tx => tx.id);
+        minedTxIds.forEach(id => this.processedTxIds.add(id));
+
         this.pendingTransactions = this.pendingTransactions.filter(
             tx => !minedTxIds.includes(tx.id)
         );
+
+        // Cleanup old processed txIds to prevent memory bloat (keep last 100k)
+        if (this.processedTxIds.size > 100000) {
+            const idsToKeep = Array.from(this.processedTxIds).slice(-50000);
+            this.processedTxIds = new Set(idsToKeep);
+        }
     }
 
     /**
      * Validate transaction
      */
     validateTransaction(tx) {
-        if (!tx.sender || !tx.recipient || !tx.amount) return false;
-        if (!isValidAddress(tx.sender) || !isValidAddress(tx.recipient)) return false;
-        if (tx.amount <= 0) return false;
-        if (tx.fee < PROTOCOL.MIN_TRANSACTION_FEE) return false;
-        // TODO: Verify signature
-        return true;
+        // Type validation
+        if (!tx || typeof tx !== 'object') {
+            return { valid: false, reason: 'Transaction must be an object' };
+        }
+
+        // Required fields check
+        if (!tx.sender || !tx.recipient || tx.amount === undefined) {
+            return { valid: false, reason: 'Missing required fields: sender, recipient, amount' };
+        }
+
+        // Address validation
+        if (!isValidAddress(tx.sender)) {
+            return { valid: false, reason: 'Invalid sender address format' };
+        }
+        if (!isValidAddress(tx.recipient)) {
+            return { valid: false, reason: 'Invalid recipient address format' };
+        }
+
+        // Amount validation
+        if (typeof tx.amount !== 'number' || tx.amount <= 0 || !Number.isFinite(tx.amount)) {
+            return { valid: false, reason: 'Amount must be a positive number' };
+        }
+
+        // Fee validation
+        if (typeof tx.fee !== 'number' || tx.fee < PROTOCOL.MIN_TRANSACTION_FEE) {
+            return { valid: false, reason: `Fee must be at least ${PROTOCOL.MIN_TRANSACTION_FEE}` };
+        }
+
+        // Nonce validation (required for replay protection)
+        if (typeof tx.nonce !== 'number' || !Number.isInteger(tx.nonce) || tx.nonce < 0) {
+            return { valid: false, reason: 'Nonce must be a non-negative integer' };
+        }
+
+        // Timestamp validation
+        if (typeof tx.timestamp !== 'number' || tx.timestamp <= 0) {
+            return { valid: false, reason: 'Timestamp must be a positive number' };
+        }
+
+        // Signature validation
+        if (!tx.signature || typeof tx.signature !== 'object') {
+            return { valid: false, reason: 'Transaction signature is required' };
+        }
+        if (!tx.senderPublicKey || typeof tx.senderPublicKey !== 'string') {
+            return { valid: false, reason: 'Sender public key is required' };
+        }
+
+        // Verify cryptographic signature
+        const txMessage = JSON.stringify({
+            sender: tx.sender,
+            recipient: tx.recipient,
+            amount: tx.amount,
+            fee: tx.fee,
+            nonce: tx.nonce,
+            timestamp: tx.timestamp
+        });
+
+        if (!verify(txMessage, tx.signature, tx.senderPublicKey)) {
+            return { valid: false, reason: 'Invalid transaction signature' };
+        }
+
+        return { valid: true };
     }
 
     /**
