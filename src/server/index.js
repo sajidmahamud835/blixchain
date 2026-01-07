@@ -82,6 +82,11 @@ class BlixnodeServer {
      * Setup REST API routes
      */
     setupRoutes() {
+        const path = require('path');
+
+        // Serve static files (dashboard)
+        this.app.use(express.static(path.join(__dirname, '../../public')));
+
         // Security: Limit JSON body size
         this.app.use(express.json({ limit: '100kb' }));
 
